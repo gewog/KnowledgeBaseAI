@@ -2,6 +2,8 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.core.logging import setup_logging, logger
 from src.config.settings import settings
 from src.core.context import extract_tenant_id_from_request, set_tenant_id
@@ -87,11 +89,40 @@ app = FastAPI(
     license_info={"name": "Proprietary"},
 )
 
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    msg = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    ae = ApiError(
+        code=_code_for_status(exc.status_code),
+        message=msg,
+        details=None,
+        request_id=getattr(request.state, "request_id", None),
+        correlation_id=get_correlation_id(),
+    )
+    return JSONResponse(status_code=exc.status_code, content=ae.model_dump())
+
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    ae = ApiError(
+        code="validation_error",
+        message="Validation error",
+        details=exc.errors(),
+        request_id=getattr(request.state, "request_id", None),
+        correlation_id=get_correlation_id(),
+    )
+    return JSONResponse(status_code=422, content=ae.model_dump())
+
+async def global_exception_handler(request: Request, exc: Exception):
+    ae = ApiError(
+        code="internal_error",
+        message="Internal server error",
+        details={"error": exc.__class__.__name__},
+        request_id=getattr(request.state, "request_id", None),
+        correlation_id=get_correlation_id(),
+    )
+    return JSONResponse(status_code=500, content=ae.model_dump())
 
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_exception_handler(Exception, global_exception_handler)
-
 
 REQ_COUNTER = Counter("http_requests_total", "Total HTTP requests", ["method", "path", "status"])
 LATENCY = Histogram("http_request_latency_ms", "Request latency ms", ["method", "path"])
@@ -150,29 +181,6 @@ def _code_for_status(status: int) -> str:
     if status == 503: return "service_unavailable"
     return "internal_error"
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    ae = ApiError(
-        code="internal_error",
-        message="Internal server error",
-        details={"error": exc.__class__.__name__},
-        request_id=getattr(request.state, "request_id", None),
-        correlation_id=get_correlation_id(),
-    )
-    return JSONResponse(status_code=500, content=ae.model_dump())
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    msg = exc.detail if isinstance(exc.detail, str) else "Request failed"
-    ae = ApiError(
-        code=_code_for_status(exc.status_code),
-        message=msg,
-        details=None,
-        request_id=getattr(request.state, "request_id", None),
-        correlation_id=get_correlation_id(),
-    )
-    return JSONResponse(status_code=exc.status_code, content=ae.model_dump())
-
 @app.get("/health", tags=["Система"], summary="Проверка состояния", description="Возвращает статус доступности ключевых зависимостей.")
 async def health():
     return {"openai": bool(settings.openai_api_key.get_secret_value()), "neo4j": bool(settings.neo4j_uri)}
@@ -186,7 +194,7 @@ origins = [o.strip() for o in (settings.cors_allow_origins or "").split(",") if 
 if origins:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
